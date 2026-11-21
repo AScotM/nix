@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -20,14 +21,17 @@ import (
 )
 
 type Config struct {
-	Interval time.Duration
-	Watch    bool
-	Limit    int
-	Threads  bool
-	Filter   string
-	Sort     string
-	JSON     bool
-	Wide     bool
+	Interval   time.Duration
+	Watch      bool
+	Limit      int
+	Threads    bool
+	Filter     string
+	Sort       string
+	JSON       bool
+	Wide       bool
+	Color      bool
+	NoColor    bool
+	ShowExited bool
 }
 type Metric struct {
 	Value     uint64 `json:"value"`
@@ -55,6 +59,7 @@ type Sample struct {
 	Voluntary   Metric `json:"voluntary_context_switches"`
 	Involuntary Metric `json:"involuntary_context_switches"`
 	Thread      bool   `json:"thread"`
+	Cgroup      string `json:"cgroup,omitempty"`
 }
 type Delta struct {
 	Value     uint64 `json:"value"`
@@ -78,18 +83,39 @@ type Record struct {
 	RatioValid  bool    `json:"ratio_valid"`
 }
 type Snapshot struct {
-	At      time.Time
-	Items   map[string]Sample
-	Scanned int
-	Skipped int
+	At          time.Time
+	Items       map[string]Sample
+	Scanned     int
+	Skipped     int
+	Cgroup      map[string]uint64
+	CgroupPath  string
+	CgroupQuota string
+}
+type ProcessIdentity struct {
+	PID    int    `json:"pid"`
+	TGID   int    `json:"tgid"`
+	Name   string `json:"name"`
+	Thread bool   `json:"thread"`
+}
+type CgroupCPU struct {
+	Path             string `json:"path,omitempty"`
+	UsageUsec        Delta  `json:"usage_usec"`
+	ThrottledUsec    Delta  `json:"throttled_usec"`
+	Periods          Delta  `json:"periods"`
+	ThrottledPeriods Delta  `json:"throttled_periods"`
+	Quota            string `json:"quota,omitempty"`
 }
 type Report struct {
-	Time            time.Time `json:"time"`
-	IntervalSeconds float64   `json:"interval_seconds"`
-	Scanned         int       `json:"scanned"`
-	Skipped         int       `json:"skipped"`
-	Matched         int       `json:"matched"`
-	Records         []Record  `json:"records"`
+	Time            time.Time         `json:"time"`
+	IntervalSeconds float64           `json:"interval_seconds"`
+	Scanned         int               `json:"scanned"`
+	Skipped         int               `json:"skipped"`
+	Matched         int               `json:"matched"`
+	Records         []Record          `json:"records"`
+	Started         int               `json:"started"`
+	Exited          int               `json:"exited"`
+	ExitedProcesses []ProcessIdentity `json:"exited_processes,omitempty"`
+	CgroupCPU       CgroupCPU         `json:"cgroup_cpu"`
 }
 
 func main() {
@@ -98,19 +124,26 @@ func main() {
 	flag.Float64Var(&seconds, "interval", 2, "sampling interval in seconds")
 	flag.BoolVar(&cfg.Watch, "watch", false, "continuously sample until interrupted")
 	flag.IntVar(&cfg.Limit, "limit", 20, "maximum entries in each terminal report")
-	flag.BoolVar(&cfg.Threads, "threads", false, "include individual tasks from /proc/PID/task")
+	flag.BoolVar(&cfg.Threads, "threads", false, "include individual tasks from /proc/PID/task (process rows may overlap thread totals)")
 	flag.StringVar(&cfg.Filter, "filter", "", "case-insensitive process-name filter")
 	flag.StringVar(&cfg.Sort, "sort", "cpu", "sort by cpu, wait, io, ctx, sched, rss, pid")
 	flag.BoolVar(&cfg.JSON, "json", false, "emit one JSON report per sample")
 	flag.BoolVar(&cfg.Wide, "wide", false, "do not truncate process names or wait channels")
+	flag.BoolVar(&cfg.Color, "color", false, "force ANSI colors")
+	flag.BoolVar(&cfg.NoColor, "no-color", false, "disable ANSI colors")
+	flag.BoolVar(&cfg.ShowExited, "exited", false, "include exited process identities in JSON")
 	flag.Usage = func() {
-		fmt.Fprintln(flag.CommandLine.Output(), "NIX / Linux Scheduler Forensics\nUsage: nix [options]\n")
+		fmt.Fprint(flag.CommandLine.Output(), "NIX / Linux Scheduler Forensics\nUsage: nix [options]\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 	if seconds < 0.1 || seconds > 3600 || math.IsNaN(seconds) || math.IsInf(seconds, 0) || cfg.Limit < 1 || cfg.Limit > 100000 {
 		fatal(errors.New("interval must be 0.1..3600 seconds and limit 1..100000"))
 	}
+	if cfg.Color && cfg.NoColor {
+		fatal(errors.New("--color and --no-color are mutually exclusive"))
+	}
+	cfg.Color = !cfg.NoColor && (cfg.Color || (terminal() && os.Getenv("NO_COLOR") == ""))
 	cfg.Interval = time.Duration(seconds * float64(time.Second))
 	valid := map[string]bool{"cpu": true, "wait": true, "io": true, "ctx": true, "sched": true, "rss": true, "pid": true}
 	if !valid[cfg.Sort] {
@@ -134,7 +167,7 @@ func main() {
 		case <-timer.C:
 		}
 		current := snapshot(cfg)
-		report := compare(previous, current)
+		report := compare(previous, current, cfg.ShowExited)
 		sortRecords(report.Records, cfg.Sort)
 		if cfg.JSON {
 			if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
@@ -142,7 +175,9 @@ func main() {
 			}
 		} else {
 			if cfg.Watch {
-				fmt.Print("\033[2J\033[H")
+				if terminal() {
+					fmt.Print("\033[2J\033[H")
+				}
 			}
 			render(report, cfg)
 		}
@@ -155,6 +190,7 @@ func main() {
 func fatal(err error) { fmt.Fprintln(os.Stderr, "nix:", err); os.Exit(1) }
 func snapshot(cfg Config) Snapshot {
 	out := Snapshot{At: time.Now(), Items: make(map[string]Sample)}
+	out.CgroupPath, out.CgroupQuota, out.Cgroup = collectCgroup()
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		fatal(err)
@@ -197,7 +233,7 @@ func snapshot(cfg Config) Snapshot {
 	return out
 }
 func matches(p Sample, filter string) bool {
-	return strings.Contains(strings.ToLower(p.Name), strings.ToLower(filter))
+	return strings.Contains(strings.ToLower(p.Name), strings.ToLower(filter)) || strings.Contains(strings.ToLower(p.Cgroup), strings.ToLower(filter))
 }
 func key(p Sample) string { return fmt.Sprintf("%d/%d/%d", p.TGID, p.PID, p.Start) }
 func readSample(tgid, tid int, thread bool) (Sample, error) {
@@ -206,6 +242,14 @@ func readSample(tgid, tid int, thread bool) (Sample, error) {
 		base = fmt.Sprintf("/proc/%d/task/%d", tgid, tid)
 	}
 	p := Sample{PID: tid, TGID: tgid, Thread: thread}
+	if cg, err := os.ReadFile(filepath.Join(base, "cgroup")); err == nil {
+		for _, line := range strings.Split(string(cg), "\n") {
+			if strings.HasPrefix(line, "0::") {
+				p.Cgroup = strings.TrimPrefix(line, "0::")
+				break
+			}
+		}
+	}
 	data, err := os.ReadFile(filepath.Join(base, "stat"))
 	if err != nil {
 		return p, err
@@ -250,9 +294,13 @@ func readSample(tgid, tid int, thread bool) (Sample, error) {
 			case "Cpus_allowed_list":
 				p.Allowed = v
 			case "voluntary_ctxt_switches":
-				p.Voluntary = Metric{parse(v), true}
+				if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+					p.Voluntary = Metric{n, true}
+				}
 			case "nonvoluntary_ctxt_switches":
-				p.Involuntary = Metric{parse(v), true}
+				if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+					p.Involuntary = Metric{n, true}
+				}
 			}
 		}
 		status.Close()
@@ -261,9 +309,9 @@ func readSample(tgid, tid int, thread bool) (Sample, error) {
 	if err == nil {
 		f := strings.Fields(string(sched))
 		if len(f) >= 3 {
-			p.Runtime = Metric{parse(f[0]), true}
-			p.Wait = Metric{parse(f[1]), true}
-			p.Schedules = Metric{parse(f[2]), true}
+			p.Runtime = metric(f[0])
+			p.Wait = metric(f[1])
+			p.Schedules = metric(f[2])
 		}
 	}
 	ioFile, err := os.Open(filepath.Join(base, "io"))
@@ -277,9 +325,9 @@ func readSample(tgid, tid int, thread bool) (Sample, error) {
 			v = strings.TrimSpace(v)
 			switch k {
 			case "read_bytes":
-				p.Read = Metric{parse(v), true}
+				p.Read = metric(v)
 			case "write_bytes":
-				p.Write = Metric{parse(v), true}
+				p.Write = metric(v)
 			}
 		}
 		ioFile.Close()
@@ -290,6 +338,10 @@ func readSample(tgid, tid int, thread bool) (Sample, error) {
 	}
 	return p, nil
 }
+func metric(s string) Metric {
+	v, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+	return Metric{v, err == nil}
+}
 func parse(s string) uint64      { v, _ := strconv.ParseUint(strings.TrimSpace(s), 10, 64); return v }
 func parseSigned(s string) int64 { v, _ := strconv.ParseInt(strings.TrimSpace(s), 10, 64); return v }
 func diff(a, b Metric) Delta {
@@ -298,12 +350,27 @@ func diff(a, b Metric) Delta {
 	}
 	return Delta{b.Value - a.Value, true}
 }
-func compare(a, b Snapshot) Report {
+func compare(a, b Snapshot, showExited bool) Report {
 	sec := b.At.Sub(a.At).Seconds()
 	if sec <= 0 {
 		sec = 0.000001
 	}
 	out := Report{Time: b.At, IntervalSeconds: sec, Scanned: b.Scanned, Skipped: b.Skipped, Matched: len(b.Items), Records: make([]Record, 0, len(b.Items))}
+	out.CgroupCPU = compareCgroup(a, b)
+	for k, p := range a.Items {
+		if _, ok := b.Items[k]; !ok {
+			out.Exited++
+			if showExited {
+				out.ExitedProcesses = append(out.ExitedProcesses, ProcessIdentity{p.PID, p.TGID, p.Name, p.Thread})
+			}
+		}
+	}
+	for k := range b.Items {
+		if _, ok := a.Items[k]; !ok {
+			out.Started++
+		}
+	}
+	sort.Slice(out.ExitedProcesses, func(i, j int) bool { return out.ExitedProcesses[i].PID < out.ExitedProcesses[j].PID })
 	for k, p := range b.Items {
 		old, ok := a.Items[k]
 		if !ok {
@@ -340,6 +407,7 @@ func sortRecords(rows []Record, by string) {
 		switch by {
 		case "wait":
 			x, y = a.WaitPercent, b.WaitPercent
+		case "io":
 			x, y = a.ReadBPS+a.WriteBPS, b.ReadBPS+b.WriteBPS
 		case "ctx":
 			x, y = a.CtxPS, b.CtxPS
@@ -359,6 +427,8 @@ func sortRecords(rows []Record, by string) {
 	})
 }
 func render(r Report, c Config) {
+	colorEnabled = c.Color
+
 	width := 116
 	line := strings.Repeat("─", width)
 	host, _ := os.Hostname()
@@ -369,26 +439,30 @@ func render(r Report, c Config) {
 	if c.Watch {
 		mode = "LIVE"
 	}
-	fmt.Println("\033[1;36m" + strings.Repeat("═", width) + "\033[0m")
-	fmt.Printf("\033[1;36m  N I X\033[0m  \033[2m/ Linux Scheduler Forensics\033[0m%*s\n", 50, "v2.1")
-	fmt.Printf("  %-27s  %-26s  %-20s  %s\n", "HOST  "+host, "MODE  "+mode, "INTERVAL  "+fmt.Sprintf("%.2fs", r.IntervalSeconds), r.Time.Format("15:04:05"))
-	fmt.Println(line)
-	fmt.Printf("  SCANNED  \033[1m%d\033[0m     SKIPPED  \033[1m%d\033[0m     MATCHED  \033[1m%d\033[0m     COMPARED  \033[1m%d\033[0m\n", r.Scanned, r.Skipped, r.Matched, len(r.Records))
-	fmt.Printf("  FILTER   %-25q THREADS  %-8t SORT  %s\n", c.Filter, c.Threads, strings.ToUpper(c.Sort))
-	fmt.Println("\033[2m  CPU and WAIT use one-core percentages; WAIT is runnable queue delay, not sleep time.\033[0m")
+	outln("\033[1;36m" + strings.Repeat("═", width) + "\033[0m")
+	outf("\033[1;36m  N I X\033[0m  \033[2m/ Linux Scheduler Forensics\033[0m%*s\n", 50, "v2.1")
+	outf("  %-27s  %-26s  %-20s  %s\n", "HOST  "+host, "MODE  "+mode, "INTERVAL  "+fmt.Sprintf("%.2fs", r.IntervalSeconds), r.Time.Format("15:04:05"))
+	outln(line)
+	outf("  SCANNED  \033[1m%d\033[0m     SKIPPED  \033[1m%d\033[0m     MATCHED  \033[1m%d\033[0m     COMPARED  \033[1m%d\033[0m\n", r.Scanned, r.Skipped, r.Matched, len(r.Records))
+	outf("  FILTER   %-25q THREADS  %-8t SORT  %s\n", c.Filter, c.Threads, strings.ToUpper(c.Sort))
+	outln("\033[2m  CPU and WAIT use one-core percentages; WAIT is runnable queue delay, not sleep time.\033[0m")
 	show("CPU ACTIVITY", r.Records, c, "cpu")
 	show("SCHEDULER CONTENTION", r.Records, c, "wait")
 	show("DISK I/O", r.Records, c, "io")
 	show("CONTEXT SWITCHING", r.Records, c, "ctx")
-	fmt.Println("\033[2m" + line + "\033[0m")
-	fmt.Println("  N/A = inaccessible or unavailable counter  |  Rates are per second  |  Ctrl+C to exit")
+	outln("\033[2m" + line + "\033[0m")
+	outf("  STARTED %d   EXITED %d   (sampled identities; short-lived tasks may be missed)\n", r.Started, r.Exited)
+	if r.CgroupCPU.Path != "" {
+		outf("  CGROUP %s   quota=%s   throttled=%s us\n", short(r.CgroupCPU.Path, 65), r.CgroupCPU.Quota, deltaStr(r.CgroupCPU.ThrottledUsec))
+	}
+	outln("  N/A = inaccessible or unavailable counter  |  Rates are per second  |  Ctrl+C to exit")
 }
 func show(title string, rows []Record, c Config, by string) {
 	copyRows := append([]Record(nil), rows...)
 	sortRecords(copyRows, by)
-	fmt.Printf("\n\033[1;36m  %s\033[0m\n", title)
-	fmt.Printf("  %-7s %-6s %-19s %-5s %7s %7s %9s %9s %8s %7s %5s %-8s %s\n", "PID", "TGID", "PROCESS", "ST", "CPU%", "WAIT%", "READ/s", "WRITE/s", "CTX/s", "SCHED", "NICE", "POLICY", "WAIT CHANNEL")
-	fmt.Println("  " + strings.Repeat("─", 112))
+	outf("\n\033[1;36m  %s\033[0m\n", title)
+	outf("  %-7s %-6s %-19s %-5s %7s %7s %9s %9s %8s %7s %5s %-8s %s\n", "PID", "TGID", "PROCESS", "ST", "CPU%", "WAIT%", "READ/s", "WRITE/s", "CTX/s", "SCHED", "NICE", "POLICY", "WAIT CHANNEL")
+	outln("  " + strings.Repeat("─", 112))
 	count := 0
 	for _, p := range copyRows {
 		if count >= c.Limit {
@@ -421,18 +495,18 @@ func show(title string, rows []Record, c Config, by string) {
 			name = short(name, 19)
 			w = short(w, 22)
 		}
-		fmt.Printf("  %-7d %-6d %-19s %-5s %7s %7s %9s %9s %8s %7s %5d %-8s %s\n", p.Sample.PID, p.Sample.TGID, name, p.Sample.State, percent(p.CPU, p.CPUPercent), percent(p.Wait, p.WaitPercent), rate(p.Read, p.ReadBPS), rate(p.Write, p.WriteBPS), ctxRate(p), deltaStr(p.Schedules), p.Sample.Nice, policy(p.Sample.Policy), w)
+		outf("  %-7d %-6d %-19s %-5s %7s %7s %9s %9s %8s %7s %5d %-8s %s\n", p.Sample.PID, p.Sample.TGID, name, p.Sample.State, percent(p.CPU, p.CPUPercent), percent(p.Wait, p.WaitPercent), rate(p.Read, p.ReadBPS), rate(p.Write, p.WriteBPS), ctxRate(p), deltaStr(p.Schedules), p.Sample.Nice, policy(p.Sample.Policy), w)
 		if c.Wide {
-			fmt.Printf("    affinity=%s  priority=%d", p.Sample.Allowed, p.Sample.Priority)
+			outf("    affinity=%s  priority=%d  cgroup=%s", p.Sample.Allowed, p.Sample.Priority, p.Sample.Cgroup)
 			if p.RatioValid {
-				fmt.Printf("  wait/run=%.3f", p.WaitToRun)
+				outf("  wait/run=%.3f", p.WaitToRun)
 			}
-			fmt.Println()
+			outln()
 		}
 		count++
 	}
 	if count == 0 {
-		fmt.Println("  No measurable activity in this category during the sample.")
+		outln("  No measurable activity in this category during the sample.")
 	}
 }
 func short(s string, n int) string {
@@ -486,3 +560,75 @@ func policy(n uint64) string {
 		return fmt.Sprintf("POLICY-%d", n)
 	}
 }
+func terminal() bool {
+	if os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	info, err := os.Stdout.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+func collectCgroup() (string, string, map[string]uint64) {
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return "", "", nil
+	}
+	path := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "0::") {
+			path = strings.TrimPrefix(line, "0::")
+			break
+		}
+	}
+	if path == "" {
+		path = "/"
+	}
+	root := "/sys/fs/cgroup"
+	full := filepath.Join(root, strings.TrimPrefix(filepath.Clean(path), "/"))
+	data, err = os.ReadFile(filepath.Join(full, "cpu.stat"))
+	if err != nil {
+		return path, "", nil
+	}
+	stats := map[string]uint64{}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 {
+			if n, e := strconv.ParseUint(f[1], 10, 64); e == nil {
+				stats[f[0]] = n
+			}
+		}
+	}
+	quota, _ := os.ReadFile(filepath.Join(full, "cpu.max"))
+	return path, strings.TrimSpace(string(quota)), stats
+}
+func compareCgroup(a, b Snapshot) CgroupCPU {
+	result := CgroupCPU{Path: b.CgroupPath, Quota: b.CgroupQuota}
+	if a.CgroupPath == "" || a.CgroupPath != b.CgroupPath {
+		return result
+	}
+	d := func(key string) Delta {
+		x, ok := a.Cgroup[key]
+		y, ok2 := b.Cgroup[key]
+		if !ok || !ok2 || y < x {
+			return Delta{}
+		}
+		return Delta{y - x, true}
+	}
+	result.UsageUsec = d("usage_usec")
+	result.ThrottledUsec = d("throttled_usec")
+	result.Periods = d("nr_periods")
+	result.ThrottledPeriods = d("nr_throttled")
+	return result
+}
+
+var colorEnabled bool
+var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+
+func cleanANSI(s string) string {
+	if colorEnabled {
+		return s
+	}
+	return ansiPattern.ReplaceAllString(s, "")
+}
+func out(s ...any)                    { fmt.Print(cleanANSI(fmt.Sprint(s...))) }
+func outln(s ...any)                  { fmt.Print(cleanANSI(fmt.Sprintln(s...))) }
+func outf(format string, args ...any) { fmt.Print(cleanANSI(fmt.Sprintf(format, args...))) }
